@@ -1,0 +1,316 @@
+function [data, dataNew, Recording, DetectionParameters] = AnalysisAllderivations(File, AnalysisDuration,treshold)
+
+PositiveElectrodes =  ["EEG T6";"EEG T4";"EEG F8";"EEG Fp2";"EEG P4";"EEG C4";"EEG F4";"EEG Fp2";"EEG P3";"EEG C3";"EEG F3";"EEG Fp1";"EEG T5";"EEG T3";"EEG F7";"EEG Fp1"];
+NegativeElectrodes =  ["EEG O2";"EEG T6";"EEG T4";"EEG F8";"EEG O2";"EEG P4";"EEG C4";"EEG F4";"EEG O1";"EEG P3";"EEG C3";"EEG F3";"EEG O1";"EEG T5";"EEG T3";"EEG F7"];
+NumDerivation = length(PositiveElectrodes(:,1));
+data = struct('Spikes', []);
+dataNew = struct('NewSpikesCrosscorr', []);
+DBPath = pwd;
+Batch = false;
+AmpValue = 40;
+StartOfAnalysis = 0;
+AnalysisDuration = AnalysisDuration;
+SliceRecording = 'No';
+SliceDuration = 60;
+Recordinglist = File;
+MontageChoice = 1;
+[Recording] = GetRecordings(DBPath,SliceRecording,SliceDuration,Recordinglist,StartOfAnalysis,AnalysisDuration,PositiveElectrodes,NegativeElectrodes);
+% General parameters
+DetectionParameters.Fs = 200; % EEG sampling frequency - Imposed: resampled
+DetectionParameters.WindowLength = 300;             % ms   
+DetectionParameters.MinimumDistance2Spikes = 80;    % ms
+% MinimumDistance2Spikes can be increased (~125 ms) for recordings with few
+% spikes and decreased (~50 ms) for recordings with many spikes
+
+% Generic Spike Detection Parameters
+DetectionParameters.GenericCrossCorrelationThresh = 0.6; % Cross-correlation threshold
+DetectionParameters.GenericFeaturesThresh = 0.3; % Features threshold
+DetectionParameters.GenericTemplateAmplitude = AmpValue; % uV
+
+% Subject Specific spike detection parameters
+DetectionParameters.PatientSpecificCrossCorrelationThresh = 0.7; % Cross-correlation threshold
+DetectionParameters.PatientSpecificFeaturesThresh = 0.5; % Features threshold
+DetectionParameters.PatientSpecificMinimumSWI = 0.1;
+DetectionParameters.ClusterSelectionThresh = 0.05;
+parfor Derivation = 1:NumDerivation
+    % FIRST STEP: Generic spike detection
+    GenDetectedSpikes = GenericDetection(Recording,DetectionParameters,Derivation);
+    % Statistics and SWI for first detection
+    StatGenDet = SingleDerStats(GenDetectedSpikes,Recording);
+    
+    % SECOND STEP: Subject-specific detection
+    if StatGenDet.SWI>DetectionParameters.PatientSpecificMinimumSWI
+        [Clusters] = ClustersFromDetect(DetectionParameters.ClusterSelectionThresh,GenDetectedSpikes);
+        SpecificSpikes(Derivation).Epoch = SecDetFromClusters(Clusters,Recording,DetectionParameters,Derivation);
+    else
+        SpecificSpikes(Derivation).Epoch = GenDetectedSpikes.Epoch;
+    end
+end
+
+% Adjusting the beginning and the end of spikes
+[DetectedSpikes]= BegEndSpikeAdujstment(SpecificSpikes,Recording,NumDerivation,DetectionParameters);
+
+% Global SWI of Subject-specific detection
+[PatientSpecificStats.Stat, TimeLineSWI]= GlobalStats(DetectedSpikes,Recording,NumDerivation,DetectionParameters);
+ %%Global Stats%%
+
+StartAnalysis = Recording.StartAnalysis;
+EndAnalysis = Recording.EndAnalysis;
+NumElectrodes = length(Recording.Electrodes);
+
+% for CurrentEpoch=1:Recording.Epochs
+%     % Build a SpikeLine (1 if a spike is present) for each derivation and
+%     % electrode
+%     EpochDuration = EndAnalysis(CurrentEpoch)-StartAnalysis(CurrentEpoch);
+%     SpikeLine = zeros(NumDerivation, EpochDuration*DetectionParameters.Fs);
+%     SpikeLineEl = zeros(NumElectrodes, EpochDuration*DetectionParameters.Fs);
+%     
+%     for Derivation = 1:NumDerivation
+%         Det = DetectedSpikes(Derivation).Epoch;
+%         NumElRight = Recording.ElectrodesDictionary(Recording.NegativeElectrodes(Derivation,:));
+%         NumElLeft = Recording.ElectrodesDictionary(Recording.PositiveElectrodes(Derivation,:));
+% 
+%         if (length(Det) >= CurrentEpoch) && (length(Det(CurrentEpoch).Det) > 2) && (length(Det(CurrentEpoch).Det(:,1)) > 2)
+%             for IndexDetSpikes = 1:length(Det(CurrentEpoch).Det(:,1))
+%                 BegSk = round((Det(CurrentEpoch).Det(IndexDetSpikes,1)/1000-Recording.StartAnalysis(CurrentEpoch))*DetectionParameters.Fs);
+%                 EndSk = round((Det(CurrentEpoch).Det(IndexDetSpikes,2)/1000-Recording.StartAnalysis(CurrentEpoch))*DetectionParameters.Fs);
+%                 if BegSk >0 && EndSk < length(SpikeLine(Derivation,:))
+%                     SpikeLine(Derivation,BegSk:EndSk-1) = ones(1,EndSk-BegSk);
+%                     SpikeLineEl(NumElLeft,BegSk:EndSk-1) = ones(1,EndSk-BegSk); 
+%                     SpikeLineEl(NumElRight,BegSk:EndSk-1) = ones(1,EndSk-BegSk); 
+%                 end
+%             end
+%         end
+%     end
+%     
+%     SumSpikeLine = sum(SpikeLine);
+%     SumSpikeLineEl = sum(SpikeLineEl);
+% end
+
+% the locs spike is in term of data position
+%les locspikes sont bien situés au milieu des pointes ondes (cf googleDoc
+%pour plus d'infos)
+
+%si locsSpikes est le milieu du spikes on peut le retrouver en fct de sa
+%taille, mais le problème est que les spikes ont des tailles différentes
+SizeSpikes = [];
+for Derivation = 1:NumDerivation
+    if ~isempty(DetectedSpikes(Derivation).Epoch.Det)
+        %les detected spikes sont en ms donc *200/1000 pour convertir en data position
+        SizeSpikes = [SizeSpikes; DetectedSpikes(Derivation).Epoch.Det(:,2)*200/1000 - DetectedSpikes(Derivation).Epoch.Det(:,1)*200/1000];      
+    end
+end
+%en moyenne les spikes ont une taille (en point position): 
+SiZeSpikeMean = round(mean(SizeSpikes));
+
+%Etape 1: identifier a chaque locspikes quel derivation a la plus grande
+%correlation avec le template de base:
+%Template de base:
+[GenericTemplate] = GenerateGenericTemplate(DetectionParameters);
+%Il faut pouvoir comparer ce template avec les datas de chaque dérivation
+%et donc avoir les ProcessedData de cahque Derivation
+SumProcessedData = [];
+for Derivation = 1:NumDerivation
+    [RawData] = GetData(Recording,1,Derivation,DetectionParameters);
+    [ProcessedData] = PreProcessing(RawData,DetectionParameters);
+    SumProcessedData = [SumProcessedData; ProcessedData];
+end
+%NewSpikes struct creation:
+
+NewSpikesCell = cell(1,16);
+%delay = 100*200/1000; %delay of 100 ms to represent propagation of spike in the derivations
+
+CorrelationMatrix = zeros(NumDerivation,length(TimeLineSWI.locsSpikes));
+for i = 1:length(TimeLineSWI.locsSpikes)
+    loc = TimeLineSWI.locsSpikes(i);
+    CorrelValues = [0,0];
+    if loc+60 < length(SumProcessedData) && loc-60 > 0 % to avoid etreme values errors
+        for j = 1:NumDerivation
+            spike = SumProcessedData(j,(loc-60:loc+60));
+            if CorrelValues(2) < max(abs(normxcorr2(GenericTemplate.Template,spike)))
+                CorrelValues(1) = j;
+                %abs car corr pos ou neg
+                CorrelValues(2) = max(abs(normxcorr2(GenericTemplate.Template,spike)));
+            end
+        end
+        TemplateSpike = SumProcessedData(CorrelValues(1),(loc-round(SiZeSpikeMean/2):loc+round(SiZeSpikeMean/2)));
+        %With the derivation used as template we go through each derivation
+        for j = 1:NumDerivation
+            %NewSpikes.Deriv(j) = [];
+            spike = SumProcessedData(j,(loc-round(SiZeSpikeMean/2):loc+round(SiZeSpikeMean/2)));
+            CorrelationMatrix(j,i) = [max(abs(normxcorr2(TemplateSpike,spike)))];
+            if CorrelationMatrix(j,i) > treshold
+                %we have to identify which correlated derivations is enough to also
+                %consider it as a spike
+                %We use the same formalism as in Analysis2derivations but
+                %for every derivations
+                NewSpikesCell{j} = [NewSpikesCell{j}; loc-round(SiZeSpikeMean/2) loc+round(SiZeSpikeMean/2)]; 
+            end
+
+        end
+     end
+end
+for z = 1:NumDerivation
+    %NewSpikes(z)
+%We use the same formalism as in Analysis2derivations but
+%for every derivations        
+    if ~isempty(NewSpikesCell{z}) && PatientSpecificStats.Stat.GlobalSWIG > 0
+
+        NewSpikes = NewSpikesCell{z};
+        %Spikes already computed with the SpikeDetection in the derivation B
+        %Spike position in term of data position -> round(DetectedSpikes*200/1000)
+        %abs because sometimes the first element is negative 
+        Spikes_already_computed = round(abs(DetectedSpikes(z).Epoch.Det)*200/1000);
+        
+        %Put Spikes in 0 or 1 binary row array
+        SpikeLineNew = zeros(1, length(SumProcessedData)+1); % 1 to avoid problem at the end of the data
+        for i = 1:length(NewSpikes(:,1))
+            SpikeLineNew(1,NewSpikes(i,1): NewSpikes(i,2)-1) = ones(1,NewSpikes(i,2) -NewSpikes(i,1));
+        end
+        SpikeLineAlready = zeros(1, length(SumProcessedData)+1);
+        if ~isempty(Spikes_already_computed)
+            for i = 1:length(Spikes_already_computed(:,1))
+                SpikeLineAlready(1,Spikes_already_computed(i,1):Spikes_already_computed(i,2)-1) = ones(1,Spikes_already_computed(i,2) -Spikes_already_computed(i,1));
+            end
+        end
+        Sum_New_andAlready = SpikeLineNew + SpikeLineAlready;
+        
+        %If spike NewSpike is completely in Spikes_already_computed -> the new spike is the
+        %same as the already computed spike, we can remove it from SpikeLineNew
+        %begin at 2 because of SpikeLineNew(i-1)
+        for i = 2:1:length(Sum_New_andAlready)
+            if Sum_New_andAlready(i) == 2 && SpikeLineNew(i-1) == 0
+                j =i;
+                while Sum_New_andAlready(j) == 2 
+                    j = j + 1;
+                end
+                if SpikeLineNew(j+1) == 0
+                    %% -> if we reach this case: the new spike is completely framed in a already computed spike
+                    SpikeLineNew(1, i:j-1) = zeros(1, j-i);
+                end
+            end
+        end
+        
+        %We need to get back a list with start and end point of the spikes of the
+        %New spikes in NewSpikes_cleaned
+        % and we need to isolate spikes only present in New Spikes in Isolated_new_spikes
+        %% **Dirty code** 
+        NewSpikes_cleaned = [];
+        Isolated_new_spikes = [];
+        spike_presence = 0;
+        spike_presence_isolated = 1;
+        for i = 1: length(NewSpikes(:,1))
+            spike_presence_isolated = 1;
+            for j = NewSpikes(i,1) : NewSpikes(i,2)
+                if SpikeLineNew(j) == 1
+                    spike_presence = 1;
+                end
+                if SpikeLineAlready(j) == 1
+                    spike_presence_isolated = 0;
+                end
+            end
+            if spike_presence == 1
+                NewSpikes_cleaned = [NewSpikes_cleaned; NewSpikes(i,1) NewSpikes(i,2)];
+                spike_presence = 0;
+            end
+            if spike_presence_isolated == 1
+                Isolated_new_spikes = [Isolated_new_spikes; NewSpikes(i,1) NewSpikes(i,2)];
+            end    
+        end
+        
+        %Remove isolated spikes from NewSpikes_cleaned 
+        NewSpikes_cleaned_superposed = NewSpikes_cleaned;
+        if ~isempty(Isolated_new_spikes) && ~isempty(NewSpikes_cleaned_superposed)
+        %start from end because of deletion
+            for j = 1 : length(Isolated_new_spikes(:,1))
+                for i = length(NewSpikes_cleaned_superposed(:,1)): -1 : 1 
+                    if ~isempty(NewSpikes_cleaned_superposed)
+                        if NewSpikes_cleaned_superposed(i,1)  == Isolated_new_spikes(j,1)  
+                            NewSpikes_cleaned_superposed(i,:) = [];
+                        end
+                    end
+                end
+            end
+        end
+        
+        
+        %To compare The NewSpike_cleaned list with the Spikes_already_computed with
+        %the function derived from GlobalStats (cf GlobalStats line 65-77), they need to have the same size so
+        %we will only keep Spikes already computed that superpose with NewSpikes cleaned
+        
+        %remove Spike_already_computed that are not superposed with NewSpikes_cleaned_superposed 
+        Spikes_already_computed_superposed = [];
+        NewSpikes_cleaned_superposed_final = [];
+        if ~isempty(Spikes_already_computed)
+            for i = 1: length(Spikes_already_computed(:,1))
+                if ~isempty(NewSpikes_cleaned_superposed)
+                for j = 1: length(NewSpikes_cleaned_superposed(:,1))
+                    if (Spikes_already_computed(i,1) > NewSpikes_cleaned_superposed(j,1) && Spikes_already_computed(i,1) < NewSpikes_cleaned_superposed(j,2)) || (Spikes_already_computed(i,2) > NewSpikes_cleaned_superposed(j,1) && Spikes_already_computed(i,2) < NewSpikes_cleaned_superposed(j,2))
+                        Spikes_already_computed_superposed = [Spikes_already_computed_superposed; Spikes_already_computed(i,1) Spikes_already_computed(i,2)];
+                        NewSpikes_cleaned_superposed_final = [NewSpikes_cleaned_superposed_final; NewSpikes_cleaned_superposed(j,1) NewSpikes_cleaned_superposed(j,2)];
+                    end
+                end
+                end
+            end
+        end
+        
+        %Now we use the GlobalStats function spike counting from different
+        %derivations if it is considered as the same spike
+        %locsSpikes(index) -> Spikes_already_computed_superposed(i,1) -> locsSpikesAlready(i)
+        %locsSpikes(index + 1) -> NewSpikes_cleaned_superposed(i,1) -> locsSpikesNew(i)
+        locsSpikesNew = [];
+        locsSpikesAlready = []; 
+        
+        if ~isempty(Spikes_already_computed_superposed)
+            for i = 1:length(Spikes_already_computed_superposed(:,1))
+                locsSpikesNew(i) = NewSpikes_cleaned_superposed_final(i,1) + round((NewSpikes_cleaned_superposed_final(i,2) - NewSpikes_cleaned_superposed_final(i,1))/2);
+                locsSpikesAlready(i) = Spikes_already_computed_superposed(i,1) + round((Spikes_already_computed_superposed(i,2) - Spikes_already_computed_superposed(i,1))/2);
+            end
+        end
+        
+        %start from end because of deletion
+        for index = length(locsSpikesNew):-1:1
+            localpeak = locsSpikesAlready(index);
+            localpeakNext = locsSpikesNew(index);
+            if localpeakNext-localpeak<round(DetectionParameters.MinimumDistance2Spikes/1000*DetectionParameters.Fs)
+                NewSpikes_cleaned_superposed_final(index,:) = [];
+            end
+        end
+        %We have the list of NewSpikes superposed with already compute spikes in
+        %this derivation
+        %if we add the NewSpikes that were completely isolated: Isolated_new_spikes
+        %We get the final list of New Spikes added due to the crosscorrelation
+        NewSpikesCrosscorr = sort([NewSpikes_cleaned_superposed_final; Isolated_new_spikes]);
+
+        %Number of Spikes initially in the derivation z:
+        %not*200/1000 because to pass it in GlobalStats I need
+        %DetectedSpikes in ms
+        data(z).Spikes = DetectedSpikes(z).Epoch.Det;
+        %Number of negatively crosscorrelated spikes with the Spikes of derivation A in derivation B: 
+        NewSpikes;
+        %Number of NEW negatively crosscorrelated spikes with the Spikes of derivation A in derivation B (that were not considered as spikes in the derivation B before)
+        NewSpikesCrosscorr;
+        
+        %*1000/200 because we need to have the information in ms to pass it
+        %in global Stats
+        dataNew(z).NewSpikesCrosscorr = NewSpikesCrosscorr*1000/200;
+
+        %So: the derivation B has a total of:
+%         if ~isempty(NewSpikesCrosscorr)
+%             NewTotSpikesB = length(SpecificSpikesAdj(DerivB).Epoch.Det) +  length(NewSpikesCrosscorr(:,1));
+%         else
+%             NewTotSpikesB = length(SpecificSpikesAdj(DerivB).Epoch.Det);
+%         end
+        %due to the addition of a vertical negatively crosscorrelated analysis with the neighboring derivation
+    else
+        %Number of Spikes initially in the derivation A:
+        %SpikesA = SpecificSpikesAdj(DerivA).Epoch.Det*200/1000;
+        %Number of Spikes initially in the derivation B:
+        %SpikesB = SpecificSpikesAdj(DerivB).Epoch.Det*200/1000
+        %data.NewSpikes = 0;
+        data(z).Spikes = DetectedSpikes(z).Epoch.Det;
+        dataNew(z).NewSpikesCrosscorr = [0 0];
+    end
+end
+
+
